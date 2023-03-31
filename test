@@ -1,0 +1,412 @@
+package com.anthem.spfi.MemberFeaturesPull
+
+import com.anthem.spfi.config.ConfigKey
+import com.anthem.spfi.helper.{ OperationSession, Operator }
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.functions._
+import java.io.File
+import org.apache.spark.sql.expressions.Window
+import scala.collection.mutable.HashMap
+import org.apache.spark.sql.types.DataTypes
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.storage.StorageLevel
+//import com.splicemachine.encoding.debug.DataType
+import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.functions.{ concat, lit, explode, split, concat_ws, when, regexp_replace }
+import org.apache.spark.storage.StorageLevel
+import java.util.Calendar
+import java.time.LocalDate
+import org.apache.hadoop.fs.Path
+import java.time.format.DateTimeFormatter
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import org.apache.spark.sql.types.DataTypes
+import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types.TimestampType
+import java.time.LocalDateTime
+import com.anthem.spfi.config.SparkConfig
+import org.apache.spark.sql.SaveMode
+import com.anthem.spfi.helper.SpfiAudit
+
+class MemberFeatureOperations(confFilePath: String, env: String, queryFileCategory: String)
+  extends OperationSession(confFilePath, env, queryFileCategory) with Operator {
+
+  println("------- Code started ------")
+
+  //Aug-19 2020 getting the  audit table column values
+  var start_time = LocalDateTime.now.format(DateTimeFormatter.ofPattern("YYYY/MM/dd HH:mm:ss"))
+
+  var programName = SparkConfig.spark.sparkContext.appName
+
+  var user_id = SparkConfig.spark.sparkContext.sparkUser
+
+  var app_id = SparkConfig.spark.sparkContext.applicationId
+
+  val SPFI_Audittbl = config.getString("SPFIAuditTbl")
+
+  def loadData(): Map[String, DataFrame] = {
+
+    //get the db.tblnm from application_<env>.properties for all tables
+
+    val fact_mbrshp_DT = config.getString("FACT_MBRSHP_tbl")
+    val fact_dly_mbrshp_DT = config.getString("FACT_DLY_MBRSHP_tbl")
+    val DDIM_MBR_KEY_MAP_DT = config.getString("DDIM_MBR_KEY_MAP_tbl")
+    val DDIM_MBR_DT = config.getString("DDIM_MBR_tbl")
+
+    val PCR_ETG_MBR_SMRY_DT = config.getString("PCR_ETG_MBR_SMRY_tbl")
+
+    val MDM_PPLTN_XWALK_DT = config.getString("MDM_PPLTN_XWALK_tbl")
+    val RSTTD_MBRSHP_MNTH_CNT_DT = config.getString("RSTTD_MBRSHP_MNTH_CNT_tbl")
+    val MBR_DT = config.getString("MBR_tbl")
+
+    val SPFI_RA_CSBD_CND_CST_RSK_SCR_DT = config.getString("SPFI_RA_CSBD_CND_CST_RSK_SCR_tbl")
+    val SPFI_RA_CSBD_PRECND_GRPR_FLG_DT = config.getString("SPFI_RA_CSBD_PRECND_GRPR_FLG_tbl")
+
+    println("Reading tables " + Calendar.getInstance().getTime())
+
+    //select whatever is required/needed from each tables.
+    val MDM_PPLTN_XWALK_df = spark.sql(s"select MCID, ALT_KEY,XWALK_TRMNTN_DT from $MDM_PPLTN_XWALK_DT")
+    println("MDM_PPLTN_XWALK_df")
+
+    val RSTTD_MBRSHP_MNTH_CNT_df = spark.sql(s"""select MBR_KEY, PHRMCY_MBR_EXPSR_NBR, ELGBLTY_CLNDR_MNTH_END_DT from $RSTTD_MBRSHP_MNTH_CNT_DT""")
+    println("read RSTTD_MBRSHP_MNTH_CNT_df")
+
+    //fact_daily
+    val fact_dly_mbrshp_df = spark.sql(s"""select MCID,CLNCL_PGM_BSNS_SGMNT_CD,EXTRNL_LOAD_CD,ST_CD,MBR_DIM_KEY,AGE_IN_YEARS_NBR from $fact_dly_mbrshp_DT""")
+    println("read fact_dly_mbrshp_df")
+
+    val fact_mbrshp_df = spark.sql(s"""select MCID,ELGBLTY_CY_MNTH_END_NBR,CLNCL_PGM_BSNS_SGMNT_CD,EXTRNL_LOAD_CD,
+     ST_CD,MBR_DIM_KEY,AGE_IN_YEARS_NBR,MDCL_EXPSR_NBR,PHRMCY_EXPSR_NBR
+      from $fact_mbrshp_DT""")
+
+    println("read fact_mbrshp_df")
+
+    val PCR_ETG_MBR_SMRY_df = spark.sql(s"select * from $PCR_ETG_MBR_SMRY_DT")
+    println("read PCR_ETG_MBR_SMRY_df")
+
+    //val MberDF = spark.sql(s"select MBRSHP_SOR_CD, SRC_GRP_NBR, HC_ID,SBSCRBR_ID, MBR_SQNC_NBR, trim(MBR_KEY) as MBR_KEY from $MBR_DT")
+    //println("read MberDF")
+
+    //Oct-29-2020 De-tokenization of MBR source table
+    spark.udf.register("ptyUNProtectStr", com.protegrity.spark.udf.ptyUnprotectStr _);
+    val MberDF = spark.sql(s"select MBRSHP_SOR_CD, SRC_GRP_NBR,case when hc_id in ('NA', 'UNK') then hc_id else ptyUNProtectStr(hc_id,'MEMBERIDENTIFIERS_UPPERALPHANUM_LP') end as hc_id,case when sbscrbr_id in ('NA', 'UNK') then sbscrbr_id else ptyUNProtectStr(sbscrbr_id , 'MEMBERIDENTIFIERS_UPPERALPHANUM_LP') end as sbscrbr_id, MBR_SQNC_NBR, trim(MBR_KEY) as MBR_KEY from $MBR_DT")
+    println("read MberDF")
+
+    val DDIM_MBR_KEY_MAPDF = spark.sql(s"Select trim(MBR_KEY)as MBR_KEY,MBR_DIM_KEY from $DDIM_MBR_KEY_MAP_DT")
+    println("read DDIM_MBR_KEY_MAPDF")
+
+    val DDIM_MBRDF = spark.sql(s"Select MBR_DIM_KEY,MBR_GNDR_CD from $DDIM_MBR_DT")
+    println("read DDIM_MBRDF")
+
+    val SPFI_RA_CSBD_CND_CST_RSK_SCRDF = spark.sql(s"select * from $SPFI_RA_CSBD_CND_CST_RSK_SCR_DT")
+    println("read SPFI_RA_CSBD_CND_CST_RSK_SCRDF")
+
+    var SPFI_RA_CSBD_PRECND_GRPR_FLGDF = spark.sql(s"Select * from $SPFI_RA_CSBD_PRECND_GRPR_FLG_DT")
+    println("read SPFI_RA_CSBD_PRECND_GRPR_FLGDF")
+
+    fact_mbrshp_df.persist(StorageLevel.MEMORY_ONLY)
+    fact_dly_mbrshp_df.persist(StorageLevel.MEMORY_ONLY)
+    println("Read all table " + Calendar.getInstance().getTime())
+
+    val dfMapOutput = Map(config.getString("FACT_DLY_MBRSHP_tbl") -> fact_dly_mbrshp_df, config.getString("FACT_MBRSHP_tbl") -> fact_mbrshp_df, config.getString("PCR_ETG_MBR_SMRY_tbl") -> PCR_ETG_MBR_SMRY_df,
+      config.getString("MDM_PPLTN_XWALK_tbl") -> MDM_PPLTN_XWALK_df, config.getString("RSTTD_MBRSHP_MNTH_CNT_tbl") -> RSTTD_MBRSHP_MNTH_CNT_df,
+      config.getString("MBR_tbl") -> MberDF, config.getString("DDIM_MBR_KEY_MAP_tbl") -> DDIM_MBR_KEY_MAPDF,
+      config.getString("DDIM_MBR_tbl") -> DDIM_MBRDF, config.getString("SPFI_RA_CSBD_CND_CST_RSK_SCR_tbl") -> SPFI_RA_CSBD_CND_CST_RSK_SCRDF,
+      config.getString("SPFI_RA_CSBD_PRECND_GRPR_FLG_tbl") -> SPFI_RA_CSBD_PRECND_GRPR_FLGDF)
+
+    println("All the table loaded")
+    return dfMapOutput
+  }
+
+  def processData(inDFs: Map[String, DataFrame]): Map[String, DataFrame] = {
+    //call by value from loadData()
+
+    var fact_dly_mbrshp_df = inDFs.getOrElse(config.getString("FACT_DLY_MBRSHP_tbl"), null)
+    // println("fact_dly_mbrshp_df tbl count:" + fact_dly_mbrshp_df.count())
+    var fact_mbrshp_df = inDFs.getOrElse(config.getString("FACT_MBRSHP_tbl"), null)
+    val PCR_ETG_MBR_SMRY_df = inDFs.getOrElse(config.getString("PCR_ETG_MBR_SMRY_tbl"), null)
+    val MDM_PPLTN_XWALK_df = inDFs.getOrElse(config.getString("MDM_PPLTN_XWALK_tbl"), null)
+    val RSTTD_MBRSHP_MNTH_CNT_df = inDFs.getOrElse(config.getString("RSTTD_MBRSHP_MNTH_CNT_tbl"), null)
+
+    val MberDF = inDFs.getOrElse(config.getString("MBR_tbl"), null)
+    val DDIM_MBR_KEY_MAPDF = inDFs.getOrElse(config.getString("DDIM_MBR_KEY_MAP_tbl"), null)
+    val DDIM_MBRDF = inDFs.getOrElse(config.getString("DDIM_MBR_tbl"), null)
+    var SPFI_RA_CSBD_CND_CST_RSK_SCRDF = inDFs.getOrElse(config.getString("SPFI_RA_CSBD_CND_CST_RSK_SCR_tbl"), null)
+    var SPFI_RA_CSBD_PRECND_GRPR_FLGDF = inDFs.getOrElse(config.getString("SPFI_RA_CSBD_PRECND_GRPR_FLG_tbl"), null)
+
+    import spark.implicits._
+
+    println("processing Started")
+    val maxElgibilityCY = fact_mbrshp_df.agg(max(MemberFeatureConstants.ELGBLTY_CY_MNTH_END_NBR)).head().getLong(0)
+    println("maxElgibilityCY from fact_mbrshp_df " + maxElgibilityCY)
+
+    // Replacing Null with UNK for DDIM_MBR table
+    var DDIM_MBRDFMod = DDIM_MBRDF.na.fill("UNK", Seq(MemberFeatureConstants.MBR_GNDR_CD))
+    println("null filled for DDIM_MBRDFMod")
+
+    val todaysDate = new SimpleDateFormat("yyyy-MM-dd").format(new Date())
+    //println("todaysdate : " + todaysDate)
+    //added 02/14
+    var FACT_DLY_MBRSHPDFMod = fact_dly_mbrshp_df.filter(col(MemberFeatureConstants.CLNCL_PGM_BSNS_SGMNT_CD).equalTo("COMMERCIAL")
+      .and(col(MemberFeatureConstants.EXTRNL_LOAD_CD).equalTo("I"))
+      .and(col(MemberFeatureConstants.MBR_PROD_ENRLMNT_TRMNTN_DT).>(todaysDate)))
+    println("FACT_DLY_MBRSHPDFMod ")
+    //FACT.MBR_PROD_ENRLMNT_TRMNTN_DT>current_date
+
+    //Filtering the fact_mbrship table
+    //var FACT_MBRSHPDFMod = fact_mbrshp_df.filter(col(MemberFeatureConstants.CLNCL_PGM_BSNS_SGMNT_CD).equalTo("COMMERCIAL")
+    //   .and(col(MemberFeatureConstants.EXTRNL_LOAD_CD).equalTo("I"))
+    // .and(col(MemberFeatureConstants.ELGBLTY_CY_MNTH_END_NBR).equalTo(maxElgibilityCY))
+    // .and(col(MemberFeatureConstants.MDCL_EXPSR_NBR).>(0).or(col(MemberFeatureConstants.PHRMCY_EXPSR_NBR).>(0))))
+
+    //FACT_MBRSHPDFMod = FACT_MBRSHPDFMod.withColumn(
+    // MemberFeatureConstants.ST_CD,
+    // when(col(MemberFeatureConstants.ST_CD).equalTo("").
+    //  or(col(MemberFeatureConstants.ST_CD).isNull), lit("UNK"))
+    // .otherwise(col(MemberFeatureConstants.ST_CD)))
+
+    FACT_DLY_MBRSHPDFMod = FACT_DLY_MBRSHPDFMod.withColumn(
+      MemberFeatureConstants.ST_CD,
+      when(col(MemberFeatureConstants.ST_CD).equalTo("").
+        or(col(MemberFeatureConstants.ST_CD).isNull), lit("UNK"))
+        .otherwise(col(MemberFeatureConstants.ST_CD)))
+
+    print("FACT_DLY_MBRSHPDFMod ")
+
+    //Creating concatenated column of 4 columns values for MBR table
+    val MberDFMod = MberDF.withColumn(
+      MemberFeatureConstants.MBR_SPFI_ID,
+      when(
+        col("MBRSHP_SOR_CD").===(824).&&(length(col("HC_ID")).===(lit(13))).&&(col("SBSCRBR_ID").!==(col("HC_ID"))),
+        concat_ws("-", col("MBRSHP_SOR_CD"), col("SRC_GRP_NBR"), substring(col("HC_ID"), 0, 9).as("HC_ID"), col("MBR_SQNC_NBR")))
+        .otherwise(concat_ws("-", col("MBRSHP_SOR_CD"), col("SRC_GRP_NBR"), col("HC_ID"), col("MBR_SQNC_NBR"))))
+      .withColumn(MemberFeatureConstants.SRC_KEY, concat_ws("-", col("MBRSHP_SOR_CD"),
+        col("SRC_GRP_NBR"), col("SBSCRBR_ID"), col("MBR_SQNC_NBR")))
+
+    //print("MberDFMod count: "+ MberDFMod.count())
+    // Joining MBR and DDIM_MBR_KEY and Fact_mbrship table
+    //var baseJoin = MberDFMod.join(DDIM_MBR_KEY_MAPDF, Seq(MemberFeatureConstants.MBR_KEY))
+    // .join(FACT_MBRSHPDFMod, Seq(MemberFeatureConstants.MBR_DIM_KEY))
+    // println("baseJoin count")
+
+    var baseJoin = MberDFMod.join(DDIM_MBR_KEY_MAPDF, Seq(MemberFeatureConstants.MBR_KEY))
+      .join(FACT_DLY_MBRSHPDFMod, Seq(MemberFeatureConstants.MBR_DIM_KEY))
+
+    println("baseJoin ")
+
+    var joinBaseJoin_DDIMBr = baseJoin.join(DDIM_MBRDFMod, Seq(MemberFeatureConstants.MBR_DIM_KEY),
+      MemberFeatureConstants.Left)
+    println("Generated joinBaseJoin_DDIMBr  ")
+
+    //Joining above output table with SPFI_RA_CSBD_CND_CST_RSK_SCR and SPFI_RA_CSBD_PRECND_GRPR_FLG
+    var intermediate = joinBaseJoin_DDIMBr.join(SPFI_RA_CSBD_CND_CST_RSK_SCRDF, Seq("MCID"), MemberFeatureConstants.Left)
+      .join(SPFI_RA_CSBD_PRECND_GRPR_FLGDF, Seq("MCID"), MemberFeatureConstants.Left)
+      .select(MemberFeatureConstants.ColumnsSeq.map(name => col(name)): _*)
+    println("Generated intermediate DF  ")
+
+    var intermediateDFMod = intermediate.withColumnRenamed(MemberFeatureConstants.AGE_IN_YEARS_NBR, "AGE_NBR")
+      .withColumnRenamed(MemberFeatureConstants.MBR_GNDR_CD, "GNDR_CD")
+    println("------- intermediateDFMod created ------")
+    intermediateDFMod.persist()
+
+    var MemberScoreDFInt = intermediateDFMod.withColumn("rank", dense_rank()
+      .over(Window.partitionBy(MemberFeatureConstants.MBR_SPFI_ID).orderBy(col("mcid").cast(DataTypes.LongType), col(MemberFeatureConstants.SRC_KEY))))
+    println("MemberScoreDFInt count: " + MemberScoreDFInt.count())
+    var MemberScoreDF = MemberScoreDFInt.filter(col("rank").===(1))
+    // println("MemberScoreDF count(top): " + MemberScoreDF.count())
+    println("------- MemberScoreDF  ------")
+    println("1st part of query completed " + Calendar.getInstance().getTime())
+    MemberScoreDF.persist(StorageLevel.MEMORY_ONLY)
+
+    ////////////////////////////////////////////1st part of query completion///////////////////////////////////////////////////////////////
+
+    val ELGBLTY_CY_MNTH_END_NBR_Hive = to_date(lit(maxElgibilityCY.toString()), "yyyyMM")
+    println("Eligibilty mnth Nbr  " + maxElgibilityCY)
+
+    val Int_DF_1 = fact_mbrshp_df.withColumn("DER_DT", ELGBLTY_CY_MNTH_END_NBR_Hive)
+
+    //println("Int_DF_1.DER_DT : "+Int_DF_1.select("DER_DT").show())
+
+    val Int_DF_2 = Int_DF_1.withColumn("LOOK_BK_DT", add_months(col("DER_DT"), -23))
+    val Int_DF_3 = Int_DF_2.withColumn("FINAL_DT_LKBACK", date_format(col("LOOK_BK_DT"), "YYYYMM")).
+      withColumn("FINAL_DT_DER", date_format(col("DER_DT"), "YYYYMM")).drop("LOOK_BK_DT", "DER_DT")
+
+    // println("FINAL_DT_LKBACK: " + Int_DF_3.select("FINAL_DT_LKBACK").show())
+    // println("FINAL_DT_DER: " + Int_DF_3.select("FINAL_DT_DER").show())
+
+    //filtering VT_mbrship_mnth for last 23 months
+    val VT_mbrship_mnth_count_df = Int_DF_3.filter(Int_DF_3.col("mcid").=!=(lit(0))
+      .and(col("ELGBLTY_CY_MNTH_END_NBR").>=(col("FINAL_DT_LKBACK")))
+      .and(col("ELGBLTY_CY_MNTH_END_NBR").<=(col("FINAL_DT_DER")))
+      .and(col("MDCL_EXPSR_NBR").>(lit(0)).or(col("PHRMCY_EXPSR_NBR").>(lit(0))))
+      .and(trim(col("CLNCL_PGM_BSNS_SGMNT_CD")).===("COMMERCIAL")))
+      .groupBy("MCID")
+      .agg(countDistinct("ELGBLTY_CY_MNTH_END_NBR")).toDF("MCID", "mbrship_mnth_count")
+
+    VT_mbrship_mnth_count_df.persist()
+    println("Printing the VT_mbrship_mnth_count_df")
+
+    println("All month Started")
+    // Filtering PCR_ETG_MBR_SMRY based on ETG_RUN_ID
+    var maxEtg_run_id = PCR_ETG_MBR_SMRY_df.agg(max(col("etg_run_id"))).head().getLong(0)
+    println(s"etg runid $maxEtg_run_id")
+    val MS_df = PCR_ETG_MBR_SMRY_df.filter(col("etg_run_id").===(lit(maxEtg_run_id)))
+      .select(col("MCID")).distinct().toDF("MCIDNEW")
+
+    println("Printing MS_df ")
+    MS_df.persist(StorageLevel.MEMORY_AND_DISK)
+
+    //Filtering MDM_PPLTN_XWALK table on XWALK_TRMNTN_DT column and getting distinct records for MCDI and ALT_KEY
+    val XW_DF = MDM_PPLTN_XWALK_df.filter(col("XWALK_TRMNTN_DT").===(MemberFeatureConstants.date).
+      or(col("XWALK_TRMNTN_DT").===(null))).select("MCID", "ALT_KEY").distinct()
+
+    println("Printing XW_DF")
+
+    var ELGEndate = RSTTD_MBRSHP_MNTH_CNT_df.agg(max(col("ELGBLTY_CLNDR_MNTH_END_DT"))).head().getTimestamp(0)
+    println(s"RSTTD_MBRSHP_MNTH_CNT ELGEndate $ELGEndate")
+    var ELGEndDateMod = new java.text.SimpleDateFormat("yyyy-MM-dd").format(ELGEndate)
+    println(s"RSTTD_MBRSHP_MNTH_CNT Enddate $ELGEndDateMod") /////
+    var ELGStartDateMod = GetStartDate(ELGEndate)
+    println(s"RSTTD_MBRSHP_MNTH_CNT Startdate $ELGStartDateMod")
+
+    val RSTTD_MBRSHP_MNTH_CNT_dfMod = RSTTD_MBRSHP_MNTH_CNT_df
+      .filter(col("PHRMCY_MBR_EXPSR_NBR").>(lit(0))
+        .and(col("ELGBLTY_CLNDR_MNTH_END_DT").>=(ELGStartDateMod)
+          .and(col("ELGBLTY_CLNDR_MNTH_END_DT").<=(ELGEndDateMod))
+          .or(col("ELGBLTY_CLNDR_MNTH_END_DT").===(ELGEndDateMod))
+          .or(col("ELGBLTY_CLNDR_MNTH_END_DT").===(ELGStartDateMod))))
+    println("Printing RSTTD_MBRSHP_MNTH_CNT_dfMod")
+    RSTTD_MBRSHP_MNTH_CNT_dfMod.persist()
+
+    println("RSTTD_MBRSHP_MNTH_CNT_dfMod")
+
+    val allmonth_df = MS_df.join(XW_DF, MS_df.col("MCIDNEW").===(XW_DF.col("MCID")))
+      .join(RSTTD_MBRSHP_MNTH_CNT_dfMod, RSTTD_MBRSHP_MNTH_CNT_dfMod.col("MBR_KEY").===(XW_DF.col("ALT_KEY")))
+      .groupBy(MS_df.col("MCIDNEW"), RSTTD_MBRSHP_MNTH_CNT_dfMod.col("ELGBLTY_CLNDR_MNTH_END_DT"))
+      .agg(sum(RSTTD_MBRSHP_MNTH_CNT_dfMod.col("PHRMCY_MBR_EXPSR_NBR"))).as("PHRMCY_MBR_EXPSR_NBR_SUM")
+      .toDF("MCIDNEW", "ELGBLTY_CLNDR_MNTH_END_DT", "PHRMCY_MBR_EXPSR_NBR_SUM")
+
+    println("allmonth_df completed")
+    allmonth_df.persist(StorageLevel.MEMORY_AND_DISK)
+
+    val cleanMonth_df = allmonth_df
+      .withColumn(
+        "PHRMCY_MBR_EXPSR_MONTH",
+        when(col("PHRMCY_MBR_EXPSR_NBR_SUM").>(lit(1)), lit(1))
+          .otherwise(col("PHRMCY_MBR_EXPSR_NBR_SUM")))
+
+    println("cleanMonth_df completed")
+    cleanMonth_df.persist(StorageLevel.MEMORY_AND_DISK)
+
+    val mcidAggregateDf = cleanMonth_df.groupBy("MCIDNEW").agg(sum(col("PHRMCY_MBR_EXPSR_MONTH")))
+      .toDF("MCIDNEW", "PHRMCY_MBR_EXPSR_TOTAL")
+
+    println("Printing the mcidAggregateDf")
+
+    // Joining above dataframe with VT_mbrship_mnth table
+    var rxFlagDF = mcidAggregateDf.join(VT_mbrship_mnth_count_df, mcidAggregateDf.col("MCIDNEW")
+      .equalTo(VT_mbrship_mnth_count_df.col("mcid")))
+      .withColumn("rx_pre_flag", (col("PHRMCY_MBR_EXPSR_TOTAL") / col("mbrship_mnth_count")))
+      .select("MCIDNEW", "rx_pre_flag").persist(StorageLevel.MEMORY_AND_DISK)
+
+    println("rxFlagDF ")
+    rxFlagDF.persist(StorageLevel.MEMORY_AND_DISK)
+
+    val fact_mbrshp_dfFiltered = fact_mbrshp_df.filter(col("ELGBLTY_CY_MNTH_END_NBR").===(maxElgibilityCY))
+    val rx2yearsIntermediateDf = fact_mbrshp_dfFiltered.join(rxFlagDF, fact_mbrshp_dfFiltered.col("mcid")
+      .===(rxFlagDF.col("MCIDNEW")), "LEFT")
+      .withColumn("Rx_CarveIn_Flag", when(rxFlagDF.col("rx_pre_flag").>=(lit(0.8)), 1)
+        .otherwise(lit(0)))
+      .select("mcid", "Rx_CarveIn_Flag").persist(StorageLevel.MEMORY_AND_DISK)
+
+    println("rx2yearsIntermediateDf ")
+    var rx2yearsIntermediateDfMod = rx2yearsIntermediateDf.withColumn(
+      "dens_rank",
+      dense_rank().over(Window.partitionBy("mcid")
+        .orderBy(col("Rx_CarveIn_Flag").desc)))
+      .dropDuplicates("mcid")
+      .drop("dens_rank").persist(StorageLevel.MEMORY_AND_DISK)
+
+    //*******************************************************************************************************************//
+    println("MemberScoreDF count(bottom): " + MemberScoreDF.count())
+    //Joining MemberScore table to  rx2yearsIntermediateDfMod to get the rxflag for each mcid
+    val MemberScoreWithRxFlag = broadcast(MemberScoreDF).join(rx2yearsIntermediateDfMod, Seq("mcid"), "LEFT")
+
+    MemberScoreWithRxFlag.persist()
+    var intermediateDf = MemberScoreWithRxFlag.withColumn("denseRank", dense_rank()
+      .over(Window.partitionBy(MemberFeatureConstants.MBR_SPFI_ID).
+        orderBy(col("Rx_CarveIn_Flag").desc, col("MCID"))))
+      .dropDuplicates(Seq(MemberFeatureConstants.MBR_SPFI_ID))
+
+    val intermediateDf2 = intermediateDf.withColumn(
+      "GNDR_CD",
+      when(col("GNDR_CD").equalTo("")
+        .or(col("GNDR_CD").isNull)
+        .or(col("GNDR_CD").===("NULL"))
+        .or(col("GNDR_CD").===("null")), lit("UNK"))
+        .otherwise(col("GNDR_CD"))).drop("denseRank", "rank")
+
+    val finalDF = intermediateDf2.na.fill(0)
+
+    println("all transformations completed " + Calendar.getInstance().getTime())
+    println("Final dataframe to write ")
+
+    var dataMap = Map(config.getString("spfi_mbr_mstr_feat_tbl") -> finalDF)
+    return dataMap
+  }
+
+  def writeData(outDFs: Map[String, DataFrame]): Unit = {
+
+    val finalDF = outDFs.getOrElse(config.getString("spfi_mbr_mstr_feat_tbl"), null)
+
+    val trgDbtble = config.getString("spfi_mbr_mstr_feat_tbl")
+    var pathForCsv = config.getString("moduleOutputcsvFile") + "mem_feat_csv/"
+
+    if (hdfs.exists(new Path(pathForCsv)))
+      hdfs.delete(new Path(pathForCsv), true)
+    finalDF.write
+      .format("com.databricks.spark.csv")
+      .option("header", "false")
+      .option("codec", "org.apache.hadoop.io.compress.GzipCodec")
+      .save(pathForCsv)
+
+    try {
+      println("truncating" + trgDbtble)
+
+      spark.sql("truncate table " + trgDbtble)
+    } catch {
+      case excptn: Exception => {
+        println("truncate table failed " + excptn.getMessage)
+      }
+    }
+
+    finalDF.write.mode("Overwrite").insertInto(trgDbtble)
+
+    // Aug-19 2020 getting the count to load into audit table
+    var loaded_row_count = finalDF.count()
+    println("Loaded Row Count: " + loaded_row_count)
+
+    var status = "completed"
+
+    var end_time = LocalDateTime.now.format(DateTimeFormatter.ofPattern("YYYY/MM/dd HH:mm:ss"))
+
+    import spark.implicits._
+    val MemberFeatureAudit = Seq(SpfiAudit(programName, user_id, app_id, start_time, loaded_row_count, end_time, status)).toDF("programName", "user_id", "app_id", "start_time", "loaded_row_count", "end_time", "status")
+    println(MemberFeatureAudit.show())
+
+    MemberFeatureAudit.write.mode(SaveMode.Append).insertInto(SPFI_Audittbl)
+  }
+
+  def GetStartDate(ELGEndate: java.util.Date): String = {
+    var cal = Calendar.getInstance();
+    cal.setTime(ELGEndate);
+    cal.add(Calendar.MONTH, -24); // 24 months back date
+    var ELGStartDate = cal.getTime()
+
+    var ELGEndDateMod = new java.text.SimpleDateFormat("yyyy-MM-dd").format(ELGEndate)
+    var ELGStartDateMod = new java.text.SimpleDateFormat("yyyy-MM-dd").format(ELGStartDate)
+    print(s"Max value of ELGBLTY_CLNDR_MNTH_END_DT " + ELGEndDateMod)
+    println(s"2 years old date of ELGBLTY_CLNDR_MNTH_END_DT " + ELGStartDateMod)
+    return (ELGStartDateMod) //
+  }
+}
